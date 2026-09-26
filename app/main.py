@@ -9,6 +9,8 @@ from app.schemas import (
     AmbiguityReviewResponse,
     ConfirmedFrameReviewRequest,
     ErrorResponse,
+    MasterSourcePlanRequest,
+    MasterSourcePlanResponse,
     RescanPlanRequest,
     RescanPlanResponse,
     ReviewRequest,
@@ -23,9 +25,11 @@ from app.solver import (
     ConflictingConfirmationsError,
     InvalidRangeError,
     NoFeasibleCombinationError,
+    NoFeasiblePlanError,
     NoFeasibleSequenceError,
     solve_ambiguity_review,
     solve_confirmed_frame_review,
+    solve_master_source_plan,
     solve_rescan_plan,
     solve_review,
     solve_scan_alignment,
@@ -53,8 +57,12 @@ app = FastAPI(
         "仅左 L、仅右 R 三种操作对齐两条帧序列（配对要求哈希汉明距离不"
         "超过阈值，连续 L/R 段按开段成本加逐帧成本计费），"
         "求总成本最低、同分操作串字典序最小的对齐方案。"
+        "母版取帧计划接口复用该确定性对齐结果，为每一步选定取帧来源"
+        "（M 步选左或右一帧，L/R 步必须选该侧），在连续同来源段不短于"
+        " min_run_length 的约束下最大化 质量总和 - 切换次数 × "
+        "switch_penalty，同分取来源串字典序最小者（L<R）。"
     ),
-    version="1.6.0",
+    version="1.7.0",
 )
 
 
@@ -100,6 +108,17 @@ async def conflicting_confirmations_handler(
             "message": exc.message,
             "conflicting_confirmations": exc.conflicts,
         },
+    )
+
+
+@app.exception_handler(NoFeasiblePlanError)
+async def no_feasible_plan_handler(
+    _request: Request, exc: NoFeasiblePlanError
+) -> JSONResponse:
+    # 对齐步骤上不存在满足最短同来源段长约束的取帧计划 -> 422
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "message": exc.message},
     )
 
 
@@ -206,3 +225,19 @@ async def plan_rescan(request: RescanPlanRequest) -> RescanPlanResponse:
 async def align_scans(request: ScanAlignmentRequest) -> ScanAlignmentResponse:
     result = solve_scan_alignment(request.model_dump())
     return ScanAlignmentResponse.model_validate(result)
+
+
+@app.post(
+    "/api/v1/master-source-plans",
+    response_model=MasterSourcePlanResponse,
+    tags=["alignment"],
+    summary="在扫描比对结果上生成母版取帧计划",
+    responses={
+        422: {"model": ErrorResponse, "description": "参数非法或无合法取帧计划"}
+    },
+)
+async def plan_master_source(
+    request: MasterSourcePlanRequest,
+) -> MasterSourcePlanResponse:
+    result = solve_master_source_plan(request.model_dump())
+    return MasterSourcePlanResponse.model_validate(result)

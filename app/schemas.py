@@ -369,12 +369,87 @@ class ScanAlignmentResponse(BaseModel):
     )
 
 
+class MasterSourceFrameIn(BaseModel):
+    id: str = Field(..., description="序列内唯一的帧标识（字符串）")
+    hash: str = Field(
+        ...,
+        pattern=r"^[0-9a-fA-F]{16}$",
+        description="16 位十六进制图像哈希（64 位，大小写均可），由调用方提供",
+    )
+    quality: int = Field(
+        ..., ge=0, le=100, description="该帧作为母版来源的质量分，0～100 的整数"
+    )
+
+
+class MasterSourcePlanRequest(BaseModel):
+    match_threshold: int = Field(
+        ..., ge=0, le=64, description="允许配对的哈希汉明距离上限，0～64"
+    )
+    gap_open_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="每开启一个 L/R 段的固定成本，1～100"
+    )
+    gap_frame_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="L/R 段内每帧的成本，1～100"
+    )
+    min_run_length: int = Field(
+        ..., ge=1, le=20, description="连续同来源段（含首尾段）的最短长度，1～20"
+    )
+    switch_penalty: int = Field(
+        ..., ge=0, le=100, description="每次来源切换的罚分，0～100 的整数"
+    )
+    left: list[MasterSourceFrameIn] = Field(
+        ..., max_length=100, description="第一次扫描的帧序列（0～100 帧，按原序）"
+    )
+    right: list[MasterSourceFrameIn] = Field(
+        ..., max_length=100, description="第二次扫描的帧序列（0～100 帧，按原序）"
+    )
+
+
+class MasterSourceStepOut(BaseModel):
+    index: int = Field(..., description="步骤序号，从 1 开始")
+    op: Literal["M", "L", "R"] = Field(
+        ..., description="该步的对齐操作（沿用扫描比对结果，不重新对齐）"
+    )
+    source: Literal["L", "R"] = Field(
+        ..., description="该步选定的母版来源：L=左序列，R=右序列"
+    )
+    frame_id: str = Field(..., description="该步选定来源消耗的帧 ID")
+    quality: int = Field(..., description="选定帧的质量分")
+
+
+class MasterSourcePlanResponse(BaseModel):
+    match_threshold: int
+    gap_open_cost: Union[int, float]
+    gap_frame_cost: Union[int, float]
+    min_run_length: int
+    switch_penalty: int
+    left_count: int
+    right_count: int
+    operations: str = Field(
+        ..., description="复用的扫描比对操作串（M/L/R）；双空序列时为空串"
+    )
+    step_count: int = Field(..., description="对齐步数，即 operations 的长度")
+    sources: str = Field(
+        ...,
+        description="逐步来源串（L/R），与 operations 等长；空计划时为空串",
+    )
+    quality_total: int = Field(..., description="全部步骤选定帧的质量分合计")
+    switch_count: int = Field(..., description="相邻步骤来源不同的次数")
+    score: int = Field(
+        ..., description="得分 = quality_total - switch_count × switch_penalty"
+    )
+    steps: list[MasterSourceStepOut] = Field(
+        ..., description="逐步来源与帧 ID 明细（按对齐步骤顺序）"
+    )
+
+
 class ErrorResponse(BaseModel):
     error: Literal[
         "invalid_range",
         "no_feasible_sequence",
         "no_feasible_combination",
         "conflicting_confirmations",
+        "no_feasible_plan",
     ]
     message: str
     conflicting_confirmations: Union[list[ConflictingConfirmationOut], None] = Field(
