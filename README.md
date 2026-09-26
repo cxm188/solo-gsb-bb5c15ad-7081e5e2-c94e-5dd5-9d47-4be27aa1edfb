@@ -34,11 +34,19 @@
 逐帧成本，换侧另开一段），求总成本最低、同分操作串字典序
 （`M<L<R`）最小的对齐方案。
 
+另有母版取帧计划接口：**沿用扫描比对的输入与确定性对齐结果**（每帧额外
+携带整数 `quality`，另收整数 `min_run_length` 与 `switch_penalty`），
+逐步为母版选帧——`M` 步在左、右两帧中选一帧，`L`/`R` 步必须取该侧帧，
+按步骤顺序输出、不跳步也不重新对齐；每段连续同来源（含首尾段）长度至少
+为 `min_run_length`，在全部合法计划中最大化“所选 quality 总和 − 切换
+次数 × switch_penalty”，同分取来源串字典序最小者（`L<R`）。
+
 - 语言/框架：Python 3.12 + FastAPI + Pydantic v2
 - 算法：后缀动态规划（单调队列优化 + 字典序同分裁决）+ 方向组合枚举（最多 16 种）
   + 复扫窗口划分动态规划 + 最优路径 DAG 分叉-汇合区间的最小命中集
   + 人工确认约束下的同一 DP（钉死位置 + 升序删减求冲突确认集）
   + 扫描比对的三状态仿射缺口对齐 DP（M<L<R 字典序贪心回溯）
+  + 母版取帧计划的带运行长度二选一 DP（L<R 字典序贪心回溯）
 - 置信分使用 `Decimal` 精确比较（DP 内部统一放大为整数），避免浮点同分误判
 
 ## 一条命令启动
@@ -50,10 +58,10 @@ docker compose up --build -d
 ```
 
 一条命令即完成镜像构建、后台启动与健康检查注册，容器内、外端口均为
-`8000`（即访问地址 `http://localhost:8000`）。启动后可直接使用七个接口：
+`8000`（即访问地址 `http://localhost:8000`）。启动后可直接使用八个接口：
 
 - API 地址（基址）：`http://localhost:8000`
-- 交互式文档（Swagger UI，七个接口均可在线调试）：<http://localhost:8000/docs>
+- 交互式文档（Swagger UI，八个接口均可在线调试）：<http://localhost:8000/docs>
 - 健康检查：<http://localhost:8000/health>
 - 逐帧复核：`POST http://localhost:8000/api/v1/frame-reviews`
 - 人工确认复核：`POST http://localhost:8000/api/v1/confirmed-frame-reviews`
@@ -62,6 +70,7 @@ docker compose up --build -d
 - 胶片条方向复核：`POST http://localhost:8000/api/v1/strip-direction-reviews`
 - 复扫窗口规划：`POST http://localhost:8000/api/v1/rescan-plans`
 - 扫描比对：`POST http://localhost:8000/api/v1/scan-alignments`
+- 母版取帧计划：`POST http://localhost:8000/api/v1/master-source-plans`
 
 停止服务：
 
@@ -81,6 +90,7 @@ docker compose down
 | `POST` | `/api/v1/strip-direction-reviews` | 胶片条方向复核：2～4 条胶片条的方向选择与帧号指派 |
 | `POST` | `/api/v1/rescan-plans` | 复扫窗口规划：把缺失/推断帧号划分为最低成本的连续窗口 |
 | `POST` | `/api/v1/scan-alignments` | 扫描比对：同卷胶片两次扫描的双序列对齐 |
+| `POST` | `/api/v1/master-source-plans` | 母版取帧计划：复用确定性对齐结果逐步选择母版帧来源 |
 
 ### `POST /api/v1/frame-reviews`
 
@@ -885,6 +895,130 @@ curl -s -X POST http://localhost:8000/api/v1/scan-alignments \
   步数；`pair_count + left_only_count = left_count`，
   `pair_count + right_only_count = right_count` 恒成立。
 
+### `POST /api/v1/master-source-plans`
+
+在扫描比对得到的**确定性对齐结果**之上生成母版取帧计划：对齐步骤、配对
+可行性与同分操作串裁决（`M<L<R`）与 `/api/v1/scan-alignments` 完全一致，
+本接口**只逐步选来源，不跳步、不重新对齐**。
+
+#### 请求参数
+
+字段与扫描比对基本相同，每帧额外携带 `quality`，并新增两个整数参数：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `match_threshold` | int | 允许配对的哈希汉明距离上限，0～64 |
+| `gap_open_cost` | number | 每开启一个连续 L/R 段的固定成本，1～100 |
+| `gap_frame_cost` | number | L/R 段内每帧的成本，1～100 |
+| `min_run_length` | int | 连续同来源段（含首段与尾段）的最小长度，**1～20 的整数** |
+| `switch_penalty` | int | 每发生一次 L/R 来源切换扣减的罚分，**0～100 的整数** |
+| `left` / `right` | 数组 | 两次扫描的帧序列，各 0～100 帧，按原序 |
+| `left[].id` / `right[].id` | string | 帧标识，在同一序列内唯一（两序列之间可重复） |
+| `left[].hash` / `right[].hash` | string | 16 位十六进制图像哈希（64 位，大小写均可） |
+| `left[].quality` / `right[].quality` | int | 该帧被选为母版帧时的质量分，**0～100 的整数** |
+
+#### 取帧规则与目标函数
+
+- 严格按对齐步骤顺序逐步取帧，每一步恰好选出一帧作为母版帧：
+  - `M`（配对）步：在左帧与右帧中**二选一**；
+  - `L`（仅左）步：**必须**选左序列帧；
+  - `R`（仅右）步：**必须**选右序列帧；
+- 把每步所选来源记为 `L` / `R`，形成与对齐操作串等长的来源串。每一段
+  **连续相同来源**（包括首段和尾段）长度都必须 **≥ `min_run_length`**；
+- 在全部合法计划中最大化
+
+  ```
+  score = 所选 quality 总和 - 切换次数 × switch_penalty
+  ```
+
+  其中“切换次数”为来源串中相邻两步来源不同的次数；
+- 总分相同时，取**来源串字典序最小**者，字符序规定为 `L < R`；
+- 不存在合法计划时（例如唯一的首尾段长度不足）返回 HTTP `422`，错误码
+  **`no_feasible_plan`**；参数非法（帧数超限、ID 重复、哈希非法、
+  quality/min_run_length/switch_penalty 越界或非整数等）返回错误码
+  `invalid_range`；
+- **双空输入**（`left`、`right` 均为空）返回空计划：`operations` 与
+  `sources` 均为空串、`plan_steps` 为空数组，`quality_total`、
+  `switch_count`、`score` 均为 `0`。
+
+#### 请求示例
+
+```bash
+curl -s -X POST http://localhost:8000/api/v1/master-source-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "match_threshold": 8,
+    "gap_open_cost": 10,
+    "gap_frame_cost": 2,
+    "min_run_length": 1,
+    "switch_penalty": 0,
+    "left": [
+      {"id": "L1", "hash": "0000000000000000", "quality": 90},
+      {"id": "L2", "hash": "0000000000000003", "quality": 80},
+      {"id": "L3", "hash": "ffffffffffffffff", "quality": 70}
+    ],
+    "right": [
+      {"id": "R1", "hash": "0000000000000001", "quality": 60},
+      {"id": "R2", "hash": "0000000000000002", "quality": 50},
+      {"id": "R3", "hash": "0000000000000000", "quality": 40}
+    ]
+  }'
+```
+
+对齐结果与扫描比对示例相同，为操作串 `MMLR`。`switch_penalty=0`、
+`min_run_length=1` 时两个配对步各取质量较高的左帧（90、80），随后
+`L` 步固定取 L3、`R` 步固定取 R3，来源串为 `LLLR`。
+
+#### 响应示例
+
+```json
+{
+  "match_threshold": 8,
+  "gap_open_cost": 10,
+  "gap_frame_cost": 2,
+  "left_count": 3,
+  "right_count": 3,
+  "min_run_length": 1,
+  "switch_penalty": 0,
+  "operations": "MMLR",
+  "step_count": 4,
+  "sources": "LLLR",
+  "plan_steps": [
+    {"index": 1, "op": "M", "source": "L", "frame_id": "L1", "quality": 90},
+    {"index": 2, "op": "M", "source": "L", "frame_id": "L2", "quality": 80},
+    {"index": 3, "op": "L", "source": "L", "frame_id": "L3", "quality": 70},
+    {"index": 4, "op": "R", "source": "R", "frame_id": "R3", "quality": 40}
+  ],
+  "quality_total": 280,
+  "switch_count": 1,
+  "score": 280
+}
+```
+
+字段说明：
+
+- `operations`：复用扫描比对得到的对齐操作串（`M`/`L`/`R`），
+  `step_count` 为其长度，双空输入时为空串 / `0`；
+- `sources`：逐步来源串（`L`/`R`），与 `plan_steps` 一一对应；
+- `plan_steps[]`：逐步取帧明细——`op` 为该步对齐操作，`source` 为选定
+  来源（M 步为二选一结果，L/R 步与操作一致），`frame_id` 为所选帧 ID，
+  `quality` 为该帧输入的质量分；
+- `quality_total`：全部所选帧的质量分总和；`switch_count`：来源切换次数；
+- `score`：`quality_total - switch_count × switch_penalty`，即最优目标值。
+
+#### 无合法计划示例
+
+同一例子把 `min_run_length` 提高到 `2`：对齐串 `MMLR` 的末两步分别被
+钉死为 `L`、`R`，两个尾段都只能长 1，任何来源选择都无法让首段、尾段
+同时达到长度 2，故返回 HTTP `422`：
+
+```json
+{
+  "error": "no_feasible_plan",
+  "message": "对齐共 4 步，但在 min_run_length=2 的最小连续段长度约束下不存在合法取帧计划"
+}
+```
+
 ## 算法说明
 
 令 `span = last - first`，第 i 帧的指派帧号写作 `first + d_i`。
@@ -957,6 +1091,20 @@ match(i, d) = 100 - 置信分   若该帧存在帧号 first+d 的候选
   的前提下依次尝试 `M`、`L`、`R`，即得同分操作串中按 `M<L<R` 字典序
   最小者；成本用 `Decimal` 精确累加，小数开段/逐帧成本不会产生浮点
   同分误判。
+
+母版取帧计划（`solve_master_source_plan`）：
+
+- 直接复用 `solve_scan_alignment` 的对齐步骤（含其全部入参校验与确定性
+  同分裁决），之后不再改动对齐：M 步两个来源可选，L/R 步只允许对应侧；
+- 在固定的 T 个步骤上做带运行长度的二选一后缀 DP：
+  `dp[t][s][run]` 表示第 t 步取来源 s（L/R）、当前同来源段已连续 run
+  步（含第 t 步，长度封顶在 `min_run_length`）时，第 t..T-1 步能取得的
+  最高得分；续同源不收费，仅当 `run ≥ min_run_length` 才允许换源并扣
+  `switch_penalty`，尾段要求 `run ≥ min_run_length`；
+- 复杂度 `O(T · min_run_length)`，T ≤ 200、min_run_length ≤ 20；
+- 回溯从前往后每步在保持后缀最优的前提下按 `L`、`R` 顺序优先取 `L`，
+  即得同最高分下来源串字典序最小（`L<R`）的计划；首步所有来源状态均
+  不可达时返回 `no_feasible_plan`；双空输入直接返回空计划与零合计。
 
 ## 本地开发（不使用 Docker）
 

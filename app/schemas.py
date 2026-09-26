@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Union
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 # 帧 ID 允许字符串或整数
 FrameId = Union[str, int]
@@ -301,6 +301,26 @@ class ScanFrameIn(BaseModel):
     )
 
 
+class MasterSourcePlanFrameIn(BaseModel):
+    id: str = Field(..., description="序列内唯一的帧标识（字符串）")
+    hash: str = Field(
+        ...,
+        pattern=r"^[0-9a-fA-F]{16}$",
+        description="16 位十六进制图像哈希（64 位，大小写均可），由调用方提供",
+    )
+    quality: int = Field(
+        ..., ge=0, le=100, description="该帧被选为母版帧时的质量分，0～100 的整数"
+    )
+
+    @field_validator("quality", mode="before")
+    @classmethod
+    def _quality_must_be_int(cls, value: object) -> object:
+        # Pydantic 默认把 bool 视作 int，须在类型强制前显式拒绝 true/false
+        if isinstance(value, bool):
+            raise ValueError("quality 必须是 0～100 的整数，不能是布尔值")
+        return value
+
+
 class ScanAlignmentRequest(BaseModel):
     match_threshold: int = Field(
         ..., ge=0, le=64, description="允许配对的哈希汉明距离上限，0～64"
@@ -369,12 +389,98 @@ class ScanAlignmentResponse(BaseModel):
     )
 
 
+class MasterSourcePlanRequest(BaseModel):
+    match_threshold: int = Field(
+        ..., ge=0, le=64, description="允许配对的哈希汉明距离上限，0～64"
+    )
+    gap_open_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="每开启一个 L/R 段的固定成本，1～100"
+    )
+    gap_frame_cost: Union[int, float] = Field(
+        ..., ge=1, le=100, description="L/R 段内每帧的成本，1～100"
+    )
+    min_run_length: int = Field(
+        ...,
+        ge=1,
+        le=20,
+        description=(
+            "连续同来源段（含首段与尾段）的最小长度，1～20 的整数"
+        ),
+    )
+    switch_penalty: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="每发生一次 L/R 来源切换扣减的罚分，0～100 的整数",
+    )
+    left: list[MasterSourcePlanFrameIn] = Field(
+        ..., max_length=100, description="第一次扫描的帧序列（0～100 帧，按原序）"
+    )
+    right: list[MasterSourcePlanFrameIn] = Field(
+        ..., max_length=100, description="第二次扫描的帧序列（0～100 帧，按原序）"
+    )
+
+    @field_validator("min_run_length", "switch_penalty", mode="before")
+    @classmethod
+    def _int_params_must_not_be_bool(cls, value: object) -> object:
+        # Pydantic 默认把 bool 视作 int，须在类型强制前显式拒绝 true/false
+        if isinstance(value, bool):
+            raise ValueError("必须是整数，不能是布尔值")
+        return value
+
+
+class MasterSourcePlanStepOut(BaseModel):
+    index: int = Field(..., description="步骤序号，从 1 开始，与对齐步骤同序")
+    op: Literal["M", "L", "R"] = Field(
+        ..., description="该步的对齐操作：M=配对，L=仅左序列，R=仅右序列"
+    )
+    source: Literal["L", "R"] = Field(
+        ..., description="该步母版取帧来源：L=取左序列帧，R=取右序列帧"
+    )
+    frame_id: str = Field(..., description="该步选为母版帧的帧 ID")
+    quality: int = Field(..., description="所选帧的质量分（输入 quality，0～100）")
+
+
+class MasterSourcePlanResponse(BaseModel):
+    match_threshold: int
+    gap_open_cost: Union[int, float]
+    gap_frame_cost: Union[int, float]
+    left_count: int
+    right_count: int
+    min_run_length: int = Field(..., description="连续同来源段的最小长度")
+    switch_penalty: int = Field(..., description="每次来源切换的罚分")
+    operations: str = Field(
+        ..., description="复用扫描比对得到的完整对齐操作串（M/L/R），双空时为空串"
+    )
+    step_count: int = Field(..., description="对齐步数，即 plan_steps 的长度")
+    sources: str = Field(
+        ..., description="逐步来源串（L/R），与 plan_steps 一一对应；双空时为空串"
+    )
+    plan_steps: list[MasterSourcePlanStepOut] = Field(
+        ...,
+        description=(
+            "逐步取帧明细（对齐操作、来源、所选帧 ID 与质量分）；双空时为空数组"
+        ),
+    )
+    quality_total: int = Field(
+        ..., description="全部所选帧的 quality 总和；双空序列时为 0"
+    )
+    switch_count: int = Field(
+        ..., description="来源串中相邻不同来源的切换次数；双空序列时为 0"
+    )
+    score: int = Field(
+        ...,
+        description="quality_total - switch_count × switch_penalty；双空序列时为 0",
+    )
+
+
 class ErrorResponse(BaseModel):
     error: Literal[
         "invalid_range",
         "no_feasible_sequence",
         "no_feasible_combination",
         "conflicting_confirmations",
+        "no_feasible_plan",
     ]
     message: str
     conflicting_confirmations: Union[list[ConflictingConfirmationOut], None] = Field(

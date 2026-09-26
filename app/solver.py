@@ -47,6 +47,13 @@ L/R 段成本 = 开段成本 + 段长 × 逐帧成本，换侧另开一段。用
 DP（上一步无未结算段 / 处于 L 段内 / 处于 R 段内）求最小总成本，再
 按操作串字典序（M < L < R）从前往后贪心回溯出字典序最小的最优操作串。
 
+母版取帧计划（:func:`solve_master_source_plan`）完全复用扫描比对的
+确定性对齐步骤，不跳步、不重新对齐：M 步在左/右帧间二选一，L/R 步
+固定取该侧，每段连续同来源（含首尾段）长度至少为 min_run_length。
+在固定步骤序列上做带运行长度的二选一后缀 DP，最大化所选 quality 总
+和减切换次数乘 switch_penalty，同分再按来源串字典序（L < R）从前往
+后贪心回溯取最小者。
+
 实现思路
 --------
 令 span = last - first，第 i 帧（0-based）指派到 first + d_i。
@@ -125,6 +132,19 @@ MAX_GAP_COST = Decimal("100")
 HASH_HEX_DIGITS = 16                # 16 位十六进制 = 64 位图像哈希
 _HEX_DIGIT_SET = frozenset("0123456789abcdefABCDEF")
 
+# 母版取帧计划的边界
+MIN_QUALITY = 0
+MAX_QUALITY = 100
+MIN_RUN_LENGTH = 1
+MAX_RUN_LENGTH = 20
+MIN_SWITCH_PENALTY = 0
+MAX_SWITCH_PENALTY = 100
+
+# 来源编码：左 = 0，右 = 1（同时充当 L<R 的字典序）
+SOURCE_L = 0
+SOURCE_R = 1
+SOURCE_CHARS = ("L", "R")
+
 
 class ReviewError(Exception):
     """业务校验失败的基类，携带机器可读的 code。"""
@@ -159,6 +179,12 @@ class ConflictingConfirmationsError(ReviewError):
         super().__init__(message)
         # 不可再删减的冲突确认集（按 position 升序）
         self.conflicts = conflicts
+
+
+class NoFeasiblePlanError(ReviewError):
+    """对齐步骤确定，但最小连续段长度约束下不存在合法取帧计划。"""
+
+    code = "no_feasible_plan"
 
 
 def _to_decimal(value: Any, field: str, range_desc: str = "0～100") -> Decimal:
@@ -1632,4 +1658,278 @@ def solve_scan_alignment(payload: dict[str, Any]) -> dict[str, Any]:
         "gap_cost_total": _json_number(gap_cost_total),
         "total_cost": _json_number(total_cost),
         "steps": steps,
+    }
+
+
+# ---- 母版取帧计划 ----
+
+
+def _parse_quality_map(frames: Any, side_label: str) -> dict[str, int]:
+    """解析一侧扫描序列的 {帧 ID: quality}，结构与扫描比对输入一致。
+
+    每帧除 id / hash 外必须携带整数 quality（0～100）。id 唯一性已由
+    ``_parse_scan_frames`` 校验，这里只做防御性检查。
+    """
+    qualities: dict[str, int] = {}
+    for i, frame in enumerate(frames):
+        label = f"{side_label}第 {i + 1} 帧"
+        if not isinstance(frame, dict) or "id" not in frame:
+            raise InvalidRangeError(f"{label}缺少 id 字段")
+        frame_id = frame["id"]
+        if not isinstance(frame_id, str):
+            raise InvalidRangeError(f"{label}的 id 必须是字符串")
+        quality = frame.get("quality")
+        if (
+            not isinstance(quality, int)
+            or isinstance(quality, bool)
+            or not (MIN_QUALITY <= quality <= MAX_QUALITY)
+        ):
+            raise InvalidRangeError(
+                f"帧 {frame_id!r} 的 quality 必须是 "
+                f"{MIN_QUALITY}～{MAX_QUALITY} 的整数"
+            )
+        if frame_id in qualities:
+            raise InvalidRangeError(
+                f"{side_label}序列中帧 id {frame_id!r} 重复，id 必须在序列内唯一"
+            )
+        qualities[frame_id] = quality
+    return qualities
+
+
+def solve_master_source_plan(payload: dict[str, Any]) -> dict[str, Any]:
+    """基于确定性双序列对齐生成母版取帧计划。
+
+    入参字段与 :func:`solve_scan_alignment` 完全相同（left / right /
+    match_threshold / gap_open_cost / gap_frame_cost，对齐步骤、同分操作
+    串裁决 M<L<R 与扫描比对接口完全一致，禁止跳步或重新对齐），区别：
+
+        - 每个输入帧另携整数 ``quality``（0～100），表示采用该帧的质量分；
+        - 另收整数 ``min_run_length``（1～20）与
+          ``switch_penalty``（0～100）。
+
+    逐步取帧规则：M 步可在左帧或右帧中二选一；L 步必须取左帧；R 步必须
+    取右帧。每段连续同来源（含首段与尾段）长度至少为 ``min_run_length``。
+    在全部合法计划中最大化
+
+        score = 所选 quality 总和 - 切换次数 × switch_penalty
+
+    同分取来源串字典序最小者（``L < R``）。不存在合法计划时抛
+    NoFeasiblePlanError（HTTP 422 / no_feasible_plan）；双空输入返回空
+    计划且各合计为 0。
+
+    实现：在固定的对齐步骤序列上做带运行长度的二选一 DP。后缀 DP 值
+    dp[t][s][run] = 第 t..T-1 步在第 t 步来源为 s（L/R）、当前同来源段
+    已连续 run 步（含第 t 步）时的最优得分；M 步两个来源都可选，L/R 步
+    只允许对应来源；续同源不收费、换源（仅当 run ≥ min_run_length）扣
+    switch_penalty，末段要求 run ≥ min_run_length。回溯时从前往后每步
+    优先尝试 L 再尝试 R，即得同分下来源串字典序最小的计划。
+    """
+    min_run_length = payload.get("min_run_length")
+    if (
+        not isinstance(min_run_length, int)
+        or isinstance(min_run_length, bool)
+        or not (MIN_RUN_LENGTH <= min_run_length <= MAX_RUN_LENGTH)
+    ):
+        raise InvalidRangeError(
+            f"min_run_length 必须是 "
+            f"{MIN_RUN_LENGTH}～{MAX_RUN_LENGTH} 的整数"
+        )
+    switch_penalty = payload.get("switch_penalty")
+    if (
+        not isinstance(switch_penalty, int)
+        or isinstance(switch_penalty, bool)
+        or not (MIN_SWITCH_PENALTY <= switch_penalty <= MAX_SWITCH_PENALTY)
+    ):
+        raise InvalidRangeError(
+            f"switch_penalty 必须是 "
+            f"{MIN_SWITCH_PENALTY}～{MAX_SWITCH_PENALTY} 的整数"
+        )
+
+    # 复用扫描比对的确定性对齐结果（含全部入参校验，不再重新对齐）
+    alignment = solve_scan_alignment(payload)
+    align_steps = alignment["steps"]
+
+    # quality 在对齐校验之后解析：帧结构非法时沿用扫描比对的错误信息
+    left_quality = _parse_quality_map(payload.get("left"), "左侧")
+    right_quality = _parse_quality_map(payload.get("right"), "右侧")
+
+    total_steps = len(align_steps)
+
+    # 每步允许的来源：M 步 L/R 二选一，L/R 步固定该侧
+    options: list[tuple[int, ...]] = []
+    # 每步每侧可取得的 quality（不可选侧记 None）
+    quality_by_step: list[list[int | None]] = []
+    for step in align_steps:
+        op = step["op"]
+        row: list[int | None] = [None, None]
+        if op == "M":
+            allowed_sources = (SOURCE_L, SOURCE_R)
+            row[SOURCE_L] = left_quality[step["left_id"]]
+            row[SOURCE_R] = right_quality[step["right_id"]]
+        elif op == "L":
+            allowed_sources = (SOURCE_L,)
+            row[SOURCE_L] = left_quality[step["left_id"]]
+        else:
+            allowed_sources = (SOURCE_R,)
+            row[SOURCE_R] = right_quality[step["right_id"]]
+        options.append(allowed_sources)
+        quality_by_step.append(row)
+
+    # 双空输入：对齐无步骤，直接返回空计划且各合计为 0
+    if total_steps == 0:
+        return {
+            "match_threshold": alignment["match_threshold"],
+            "gap_open_cost": alignment["gap_open_cost"],
+            "gap_frame_cost": alignment["gap_frame_cost"],
+            "left_count": 0,
+            "right_count": 0,
+            "min_run_length": min_run_length,
+            "switch_penalty": switch_penalty,
+            "operations": "",
+            "step_count": 0,
+            "sources": "",
+            "plan_steps": [],
+            "quality_total": 0,
+            "switch_count": 0,
+            "score": 0,
+        }
+
+    # ---- 后缀 DP：dp[t][s][run]（run ∈ 1..min_run_length，封顶存储）----
+    # run = min_run_length 同时表示“已满足最小段长，可在此后任意位置换源”。
+    # 用 None 表示不可达，避免与负得分（质量 0 减切换罚分）混淆。
+    dp: list[list[list[int | None]]] = [
+        [[None] * (min_run_length + 1) for _ in (SOURCE_L, SOURCE_R)]
+        for _ in range(total_steps + 1)
+    ]
+
+    def suffix_value(t: int, s: int, run: int) -> int | None:
+        """第 t 步取来源 s、当前段已连续 run 步时第 t..T-1 步的最优得分。"""
+        if s not in options[t]:
+            return None
+        gain = quality_by_step[t][s]
+        assert gain is not None
+        if t == total_steps - 1:
+            # 尾段长度必须达到 min_run_length
+            return gain if run >= min_run_length else None
+        best: int | None = None
+        # 续同来源：段长 +1（封顶在 min_run_length）
+        cont = dp[t + 1][s][min(run + 1, min_run_length)]
+        if cont is not None:
+            best = gain + cont
+        # 换来源：只有当前段已经满足最小段长才允许，换源计一次切换
+        if run >= min_run_length:
+            other = SOURCE_R if s == SOURCE_L else SOURCE_L
+            switched = dp[t + 1][other][1]
+            if switched is not None:
+                value = gain - switch_penalty + switched
+                if best is None or value > best:
+                    best = value
+        return best
+
+    for t in range(total_steps - 1, -1, -1):
+        for s in (SOURCE_L, SOURCE_R):
+            if s not in options[t]:
+                continue
+            for run in range(1, min_run_length + 1):
+                dp[t][s][run] = suffix_value(t, s, run)
+
+    # ---- 从前往后贪心回溯：同分优先取 L，得到字典序最小的最优来源串 ----
+    # 不可达性完全由 dp[0] 决定：首步允许的来源（M 步 L/R，或 L/R 步钉死
+    # 的单侧）run=1 状态均不可达时，不存在满足首尾段长度的合法计划。
+    first_options = [s for s in options[0] if dp[0][s][1] is not None]
+    if not first_options:
+        raise NoFeasiblePlanError(
+            f"对齐共 {total_steps} 步，但在 min_run_length="
+            f"{min_run_length} 的最小连续段长度约束下不存在合法取帧计划"
+        )
+
+    plan_steps: list[dict[str, Any]] = []
+    chosen_sources: list[int] = []
+    quality_total = 0
+    switch_count = 0
+
+    current_s: int | None = None
+    current_run = 0
+    for t in range(total_steps):
+        # 候选项 (来源, 与前一步状态同口径的后缀值)：续段直接取 dp[t] 值；
+        # 换源的切换罚分在旧来源状态（前一步）中结算，比较时减去一份。
+        candidates: list[tuple[int, int]] = []
+        if current_s is None:
+            # 第 1 步没有“切换”，M 步 L/R 皆候选（run=1），L/R 步仅钉死侧
+            for s in options[t]:
+                value = dp[t][s][1]
+                if value is not None:
+                    candidates.append((s, value))
+        else:
+            cont = dp[t][current_s][min(current_run + 1, min_run_length)]
+            if cont is not None:
+                candidates.append((current_s, cont))
+            if current_run >= min_run_length:
+                other = SOURCE_R if current_s == SOURCE_L else SOURCE_L
+                switched = dp[t][other][1]
+                if switched is not None:
+                    candidates.append((other, switched - switch_penalty))
+
+        # 按来源顺序 L<R 取同口径后缀值最大者：后缀最优与历史无关，逐步
+        # 取最优即拼出全局最优；同值时枚举中的 L 先被保留，得字典序最小串。
+        best_value: int | None = None
+        chosen: int | None = None
+        for s, value in sorted(candidates):
+            if best_value is None or value > best_value:
+                best_value = value
+                chosen = s
+        if chosen is None:  # 沿最优 DP 路径回溯不应触发，防御性报错
+            raise NoFeasiblePlanError(
+                f"min_run_length={min_run_length} 的最小连续段长度约束下"
+                "不存在合法取帧计划"
+            )
+
+        assert chosen is not None
+        if current_s is not None and chosen != current_s:
+            switch_count += 1
+        q = quality_by_step[t][chosen]
+        assert q is not None
+        quality_total += q
+        chosen_sources.append(chosen)
+        align_step = align_steps[t]
+        plan_steps.append(
+            {
+                "index": t + 1,
+                "op": align_step["op"],
+                "source": SOURCE_CHARS[chosen],
+                "frame_id": align_step["left_id"]
+                if chosen == SOURCE_L
+                else align_step["right_id"],
+                "quality": q,
+            }
+        )
+        if current_s is None or chosen != current_s:
+            current_run = 1
+        else:
+            current_run += 1
+        current_s = chosen
+
+    score = quality_total - switch_count * switch_penalty
+    # dp[0][s][1] 含第 0 步起的全部质量与步间切换罚分，与沿回溯路径独立
+    # 累加的 score 必须一致；回溯结束时的 current_run 即尾段长度。
+    assert score == dp[0][chosen_sources[0]][1], (
+        "取帧计划得分与 DP 最优得分不一致"
+    )
+    assert current_run >= min_run_length, "尾段长度不满足最小连续段长度"
+
+    return {
+        "match_threshold": alignment["match_threshold"],
+        "gap_open_cost": alignment["gap_open_cost"],
+        "gap_frame_cost": alignment["gap_frame_cost"],
+        "left_count": alignment["left_count"],
+        "right_count": alignment["right_count"],
+        "min_run_length": min_run_length,
+        "switch_penalty": switch_penalty,
+        "operations": alignment["operations"],
+        "step_count": total_steps,
+        "sources": "".join(SOURCE_CHARS[s] for s in chosen_sources),
+        "plan_steps": plan_steps,
+        "quality_total": quality_total,
+        "switch_count": switch_count,
+        "score": score,
     }
